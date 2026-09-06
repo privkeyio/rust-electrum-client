@@ -53,3 +53,11 @@ use-openssl = ["openssl"]
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 bitreq = { version = "0.3.4", features = ["async-https", "json-using-serde"] }
+
+# This fork exists to be used with the BLAKE2b hardfork support in privkeyio/rust-bitcoin, so its
+# own build and tests resolve against that. Cargo ignores `[patch]` in a dependency, so a consumer
+# is unaffected and supplies its own.
+[patch.crates-io]
+# Pinned to an immutable rev: `branch` is a moving ref and Cargo.lock is gitignored here,
+# so a branch would let a consensus dependency change under a fresh clone or CI run.
+bitcoin = { git = "https://github.com/privkeyio/rust-bitcoin", rev = "a1c5728d88eb93404954e86ca4fcfdb5cc2f1613" }

@@ -17,7 +17,7 @@ use std::time::Duration;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
-use bitcoin::consensus::encode::deserialize;
+use bitcoin::consensus::encode::{deserialize, deserialize_partial};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::{Script, Txid};
 
@@ -1058,9 +1058,29 @@ impl<T: Read + Write> ElectrumApi for RawClient<T> {
                 .unwrap_or(false)
         };
 
+        // The server may return between zero and the number requested, so anything larger is a
+        // protocol violation. This is checked before the count is used to size an allocation.
+        let check_count = |returned: usize| -> Result<(), Error> {
+            if returned > count {
+                return Err(Error::Message(format!(
+                    "block_headers returned {} headers, more than the {} requested",
+                    returned, count
+                )));
+            }
+            Ok(())
+        };
+
         if is_v1_6_or_later {
             // v1.6+: headers field contains array of hex strings
             let mut deserialized: GetHeadersRes = serde_json::from_value(result)?;
+            check_count(deserialized.count)?;
+            if deserialized.count != deserialized.header_hexes.len() {
+                return Err(Error::Message(format!(
+                    "block_headers declared {} headers but sent {}",
+                    deserialized.count,
+                    deserialized.header_hexes.len()
+                )));
+            }
             for header_hex in &deserialized.header_hexes {
                 let header_bytes = Vec::<u8>::from_hex(header_hex)?;
                 deserialized.headers.push(deserialize(&header_bytes)?);
@@ -1070,10 +1090,24 @@ impl<T: Read + Write> ElectrumApi for RawClient<T> {
         } else {
             // v1.4: hex field contains concatenated headers
             let deserialized: GetHeadersResLegacy = serde_json::from_value(result)?;
-            let mut headers = Vec::new();
-            for i in 0..deserialized.count {
-                let (start, end) = (i * 80, (i + 1) * 80);
-                headers.push(deserialize(&deserialized.raw_headers[start..end])?);
+            check_count(deserialized.count)?;
+            // Headers are not a fixed width. Past the BLAKE2b proof-of-work hardfork a header
+            // announces an extended 164 byte form through bit 31 of its version word, so walk
+            // the buffer by the length each header actually consumes rather than by a stride.
+            // This also replaces a slice index that panicked on a short response.
+            let mut headers = Vec::with_capacity(deserialized.count);
+            let mut offset = 0;
+            for _ in 0..deserialized.count {
+                let (header, consumed) = deserialize_partial(&deserialized.raw_headers[offset..])?;
+                headers.push(header);
+                offset += consumed;
+            }
+            if offset != deserialized.raw_headers.len() {
+                // The headers did not tile the buffer, so our parse desynced from the server's.
+                return Err(bitcoin::consensus::encode::Error::ParseFailed(
+                    "block_headers response has trailing bytes after the last header",
+                )
+                .into());
             }
             Ok(GetHeadersRes {
                 max: deserialized.max,
@@ -1460,6 +1494,7 @@ mod test {
     use super::{ChannelMessage, ElectrumSslStream, RawClient};
     use crate::api::ElectrumApi;
     use crate::config::AuthProvider;
+    use crate::types::GetHeadersRes;
     use crate::Error;
 
     // it's the default live testing electrum server, if you'd like to use a custom one set it up through
@@ -1657,6 +1692,148 @@ mod test {
                 assert_eq!(result_times[index], result.time);
             }
         }
+    }
+
+    /// Mainnet block 100,000: a legacy 80 byte header, hashed with SHA256d.
+    const V1_HEADER_HEX: &str = "0100000050120119172a610421a6c3011dd330d9df07b63616c2cc1f1cd00200000000006657a9252aacd5c0b2940996ecff952228c3067cc38d4885efb5a4ac4247e9f337221b4d4c86041b0f2b5710";
+    const V1_BLOCK_ID: &str = "000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506";
+
+    /// `profile_0_time_offset` from Bitcoin Knots' `src/test/data/block_header_v2.json` at tag
+    /// v29.4.1.knots20260508: an extended 164 byte header, hashed with BLAKE2b.
+    const V2_HEADER_HEX: &str = "000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070605040302010000112233445566778899aabbccddeeff00102030405060708090a0b0c0d0e0f0a8913577ffff001d0df0ad0b44332211efcdab89ffeeddccbbaa998877665544332211005802000003001c000000000000000000000000000000000040d10c008967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab";
+    const V2_BLOCK_ID: &str = "4b495dcf05d70a49785b799b22284fbcd9dd1209237c53c87e4674b15587d704";
+
+    /// Drives `block_headers` against a mocked server at the given protocol version.
+    ///
+    /// The response format gate reads the *cached* negotiated version, which `RawClient::from`
+    /// does not populate, so the version is primed first the way a connected client does.
+    fn block_headers_via_mock(
+        protocol_version: &str,
+        result: &str,
+    ) -> Result<GetHeadersRes, Error> {
+        let responses = server_version_response(0, protocol_version)
+            + &format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#)
+            + "\n";
+        let client = RawClient::from(MockStream::new(responses));
+        client.protocol_version()?;
+        client.block_headers(100_000, 3)
+    }
+
+    #[test]
+    fn test_block_headers_legacy_handles_mixed_header_widths() {
+        // Protocol 1.4 concatenates the headers into one blob. Past the BLAKE2b hardfork they are
+        // no longer a fixed width, so the blob can only be split by parsing each one.
+        let concatenated = format!("{V1_HEADER_HEX}{V2_HEADER_HEX}{V1_HEADER_HEX}");
+        let res = block_headers_via_mock(
+            "1.4",
+            &format!(r#"{{"count":3,"max":2016,"hex":"{concatenated}"}}"#),
+        )
+        .expect("mixed width headers must parse");
+
+        assert_eq!(res.count, 3);
+        assert_eq!(res.headers.len(), 3);
+        let ids: Vec<String> = res
+            .headers
+            .iter()
+            .map(|h| h.block_hash().to_string())
+            .collect();
+        assert_eq!(ids, vec![V1_BLOCK_ID, V2_BLOCK_ID, V1_BLOCK_ID]);
+    }
+
+    #[test]
+    fn test_block_headers_legacy_all_legacy_widths() {
+        // The historical case must be untouched.
+        let concatenated = format!("{V1_HEADER_HEX}{V1_HEADER_HEX}{V1_HEADER_HEX}");
+        let res = block_headers_via_mock(
+            "1.4",
+            &format!(r#"{{"count":3,"max":2016,"hex":"{concatenated}"}}"#),
+        )
+        .expect("legacy headers must parse");
+        assert_eq!(res.headers.len(), 3);
+        assert!(res
+            .headers
+            .iter()
+            .all(|h| h.block_hash().to_string() == V1_BLOCK_ID));
+    }
+
+    #[test]
+    fn test_block_headers_legacy_rejects_a_desynced_buffer() {
+        // A blob that does not tile into `count` headers must error rather than silently
+        // returning wrong headers, and must not panic on the short slice.
+        let truncated = format!("{V1_HEADER_HEX}{V2_HEADER_HEX}");
+        assert!(block_headers_via_mock(
+            "1.4",
+            &format!(r#"{{"count":3,"max":2016,"hex":"{truncated}"}}"#),
+        )
+        .is_err());
+
+        // Trailing bytes beyond the declared count are a desync too.
+        let padded = format!("{V1_HEADER_HEX}{V1_HEADER_HEX}00");
+        assert!(block_headers_via_mock(
+            "1.4",
+            &format!(r#"{{"count":2,"max":2016,"hex":"{padded}"}}"#),
+        )
+        .is_err());
+
+        // A buffer far shorter than `count` headers must error rather than panic; the previous
+        // fixed-stride slice indexed past the end here.
+        assert!(block_headers_via_mock(
+            "1.4",
+            &format!(r#"{{"count":3,"max":2016,"hex":"{V1_HEADER_HEX}"}}"#),
+        )
+        .is_err());
+
+        // And an empty buffer with a non-zero count.
+        assert!(block_headers_via_mock("1.4", r#"{"count":2,"max":2016,"hex":""}"#).is_err());
+    }
+
+    #[test]
+    fn test_block_headers_rejects_a_count_larger_than_requested() {
+        // `count` comes from the server and is used to size an allocation, so an absurd value
+        // must be refused before it reaches `Vec::with_capacity`, where it would abort the
+        // process rather than return an error. The helper requests 3 headers.
+        for count in ["4", "1000000000000", "18446744073709551615"] {
+            assert!(
+                block_headers_via_mock(
+                    "1.4",
+                    &format!(r#"{{"count":{count},"max":2016,"hex":""}}"#),
+                )
+                .is_err(),
+                "legacy count {}",
+                count
+            );
+            assert!(
+                block_headers_via_mock(
+                    "1.6",
+                    &format!(r#"{{"count":{count},"max":2016,"headers":[]}}"#),
+                )
+                .is_err(),
+                "v1.6 count {}",
+                count
+            );
+        }
+
+        // And v1.6 must not trust a count that disagrees with the array it sent.
+        assert!(block_headers_via_mock(
+            "1.6",
+            &format!(r#"{{"count":3,"max":2016,"headers":["{V1_HEADER_HEX}"]}}"#),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_block_headers_v1_6_handles_mixed_header_widths() {
+        // Protocol 1.6 sends an array instead, which needs no splitting, but still has to parse
+        // an extended header.
+        let res = block_headers_via_mock(
+            "1.6",
+            &format!(r#"{{"count":2,"max":2016,"headers":["{V1_HEADER_HEX}","{V2_HEADER_HEX}"]}}"#),
+        )
+        .expect("v1.6 headers must parse");
+
+        assert_eq!(res.headers.len(), 2);
+        assert_eq!(res.headers[0].block_hash().to_string(), V1_BLOCK_ID);
+        assert_eq!(res.headers[1].block_hash().to_string(), V2_BLOCK_ID);
     }
 
     #[test]
