@@ -42,15 +42,17 @@ extern crate libc;
 #[cfg(all(windows, feature = "proxy"))]
 extern crate winapi;
 
-#[cfg(feature = "proxy")]
 /// Fails the build if `bitcoin` is not the fork carrying BLAKE2b hardfork support.
 ///
 /// This crate splits concatenated block headers by parsing each one, which is only correct when
 /// `Header` understands the extended 164 byte form. Cargo only honours `[patch]` in the workspace
 /// root, so a consumer that forgets it would otherwise compile clean and mis-parse headers at
 /// runtime, past the activation height only. `V2_SIZE` exists solely on the fork.
+///
+/// This must stay outside any `cfg`: a guard that only holds for some feature sets is not a guard.
 const _: usize = bitcoin::block::Header::V2_SIZE;
 
+#[cfg(feature = "proxy")]
 pub mod socks;
 
 mod api;

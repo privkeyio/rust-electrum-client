@@ -60,4 +60,4 @@ bitreq = { version = "0.3.4", features = ["async-https", "json-using-serde"] }
 [patch.crates-io]
 # Pinned to an immutable rev: `branch` is a moving ref and Cargo.lock is gitignored here,
 # so a branch would let a consensus dependency change under a fresh clone or CI run.
-bitcoin = { git = "https://github.com/privkeyio/rust-bitcoin", rev = "a1c5728d88eb93404954e86ca4fcfdb5cc2f1613" }
+bitcoin = { git = "https://github.com/privkeyio/rust-bitcoin", rev = "e9aa336977e334f29fbe440a0dc0d21fa739fbf6" }
