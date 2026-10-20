@@ -27,7 +27,9 @@ serde_json = { version = "^1.0" }
 # Optional dependencies
 openssl = { version = "0.10", optional = true }
 rustls = { version = "0.23.21", optional = true, default-features = false }
-webpki-roots = { version = "0.25", optional = true }
+# 1.0.10 is the first release without emSign ECC Root CA - G3, whose key is compromised;
+# 1.0.4 through 1.0.9 still trust it. Do not lower this floor.
+webpki-roots = { version = "1.0.10", optional = true }
 
 byteorder = { version = "1.0", optional = true }
 
